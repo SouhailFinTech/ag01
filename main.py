@@ -264,6 +264,18 @@ def audit_code(code: str) -> list:
 
     return warnings
 
+def _json_default(obj):
+    """Handles numpy types (int64, float64, bool_, ndarray) that json.dumps can't serialize natively."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return str(obj)
+
 def format_audit_note(warnings):
     if not warnings:
         return "[AUTOMATED AUDIT] No issues flagged for this execution."
@@ -444,7 +456,7 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
                             "summary": f"Hypothesis: {hypothesis}. Results: {exec_result['results']}. Audit: {audit_warnings or 'clean'}.",
                         })
 
-            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps(exec_result)[:6000]})
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps(exec_result, default=_json_default)[:6000]})
             messages.append({"role": "user", "content": format_audit_note(exec_result.get("_audit_warnings", []))})
 
             if tool_calls_used >= max_tool_calls:
