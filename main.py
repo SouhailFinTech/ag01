@@ -194,6 +194,12 @@ def _worker(code, df_bytes, queue):
             "int": int, "str": str, "bool": bool, "print": print, "isinstance": isinstance,
             "Exception": Exception, "ValueError": ValueError, "True": True, "False": False, "None": None,
         }
+        # Compatibility shim: LLMs frequently confuse np./pd. namespaces (e.g. np.to_datetime).
+        # Only fill in gaps, never override real numpy functions.
+        for _name in ("to_datetime", "concat", "notnull", "isnull"):
+            if not hasattr(np, _name):
+                setattr(np, _name, getattr(pd, _name))
+
         namespace = {"__builtins__": safe_builtins, "pd": pd, "np": np, "df": df.copy() if df is not None else None}
         stdout_buf = io.StringIO()
         with redirect_stdout(stdout_buf):
@@ -350,6 +356,16 @@ Always:
 - Track a real equity curve from an explicit starting capital.
 - Ask when something's genuinely unclear rather than guessing on something that would change the science.
 - Address every automated audit warning or explain concretely why it doesn't apply.
+- Use pandas (`pd`) for datetime parsing and dataframe operations — `pd.to_datetime`, not
+  `np.to_datetime`. numpy does not have datetime parsing.
+- SANITY-CHECK YOUR OWN RESULTS before reporting them. If total_trades is close to the number of
+  rows in the data, your entry condition is almost certainly not filtering anything — that is a bug,
+  not a real strategy, and you must say so rather than report it as a result. If profit_pct is many
+  orders of magnitude smaller than a normal percentage (e.g. 1e-05 instead of a number like 3.2),
+  you very likely have a units/scaling bug — check whether you're returning a raw price difference
+  instead of a percentage before reporting.
+- Every variant's hypothesis must describe a genuinely different mechanism from prior attempts, not
+  a reworded restatement — near-duplicate hypotheses will be rejected automatically.
 
 Be direct and substantive — you're a working research partner, not a disclaimer generator."""
 
@@ -372,12 +388,40 @@ def build_system_prompt(df, data_quality_findings):
 # AGENT TURN
 # ============================================================
 
+def _hypothesis_too_similar(new_hyp, existing_hyps, threshold=0.75):
+    """Cheap similarity check to stop the agent looping on near-identical variants."""
+    new_words = set(re.findall(r"\w+", new_hyp.lower()))
+    if not new_words:
+        return False
+    for h in existing_hyps:
+        h_words = set(re.findall(r"\w+", h.lower()))
+        if not h_words:
+            continue
+        overlap = len(new_words & h_words) / len(new_words | h_words)
+        if overlap >= threshold:
+            return True
+    return False
+
+
 def run_agent_turn(client, model, df, messages, max_tool_calls=10):
     tool_calls_used = 0
     while True:
-        resp = client.chat.completions.create(
-            model=model, messages=messages, tools=TOOL_SCHEMA, tool_choice="auto", temperature=0.4,
-        )
+        try:
+            resp = client.chat.completions.create(
+                model=model, messages=messages, tools=TOOL_SCHEMA, tool_choice="auto", temperature=0.4,
+            )
+        except Exception as e:
+            err_name = type(e).__name__
+            with st.chat_message("assistant"):
+                if "RateLimit" in err_name:
+                    st.error(
+                        "⏳ Hit the Groq API rate limit. This usually means too many similar attempts "
+                        "were fired in a row. Wait a minute and try again, or reduce 'Max tool calls "
+                        "per turn' in the sidebar."
+                    )
+                else:
+                    st.error(f"API error ({err_name}): {e}")
+            return
         msg = resp.choices[0].message
         content = msg.content or ""
         messages.append(msg.model_dump(exclude_none=True))
@@ -411,6 +455,19 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
                 }
                 with st.chat_message("assistant"):
                     st.error("⛔ No baseline yet — variant rejected.")
+            elif run_type == "variant" and _hypothesis_too_similar(
+                hypothesis, [v["hypothesis"] for v in st.session_state.variants]
+            ):
+                exec_result = {
+                    "ok": False,
+                    "error": (
+                        "REJECTED: this hypothesis is too similar to one already tested. Propose a "
+                        "genuinely different mechanism, not a reworded copy of a prior attempt."
+                    ),
+                    "stdout": "", "_audit_warnings": [],
+                }
+                with st.chat_message("assistant"):
+                    st.error("♻️ Duplicate hypothesis rejected — propose something genuinely different.")
             else:
                 exec_result = run_code_safely(code, df) if df is not None else {
                     "ok": False, "error": "No data uploaded yet.", "stdout": ""
