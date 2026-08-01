@@ -565,7 +565,7 @@ def render_scoreboard():
 st.title("🔬 Agent 1: Researcher")
 st.caption(f"Novantix Capital — founded by {FOUNDER_NAME}, {FOUNDER_TITLE}.")
 
-for key, default in [("messages", []), ("df", None), ("baseline", None), ("variants", []), ("data_quality", [])]:
+for key, default in [("messages", []), ("df", None), ("baseline", None), ("variants", []), ("data_quality", []), ("last_error", None)]:
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -614,6 +614,13 @@ with st.sidebar:
 
 render_scoreboard()
 st.divider()
+
+if st.session_state.get("last_error"):
+    col_a, col_b = st.columns([6, 1])
+    col_a.error(f"⚠️ {st.session_state.last_error}")
+    if col_b.button("Dismiss"):
+        st.session_state.last_error = None
+        st.rerun()
 
 for m in st.session_state.messages:
     role, content = m.get("role"), m.get("content", "") or ""
