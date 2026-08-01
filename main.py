@@ -368,6 +368,11 @@ DATA QUALITY AUDIT (run automatically on upload — read this before writing any
 RESEARCH LOG FROM PAST SESSIONS (carry these lessons forward — don't repeat known mistakes):
 {past_learnings}
 
+THIS SESSION SO FAR (baseline + variants already tested — don't repeat these, and note that older
+raw execution details may have been trimmed from your visible context to save tokens; this summary
+is the reliable record of what's already been tried):
+{session_so_far}
+
 Your process is strict and two-phase:
 
 PHASE 1 — LITERAL BASELINE (happens exactly once):
@@ -407,6 +412,17 @@ Always:
 
 Be direct and substantive — you're a working research partner, not a disclaimer generator."""
 
+def summarize_session_so_far() -> str:
+    """Compact summary of this session's baseline/variants, used to keep the agent aware of
+    prior attempts even after their raw tool payloads are trimmed from the API context."""
+    b = st.session_state.get("baseline")
+    if not b:
+        return "No runs yet this session."
+    lines = [f"- Baseline: {b['results']}"]
+    for i, v in enumerate(st.session_state.get("variants", []), 1):
+        lines.append(f"- Variant {i} ('{v['hypothesis']}'): {v['results']}")
+    return "\n".join(lines)
+
 def build_system_prompt(df, data_quality_findings):
     if df is not None:
         schema = ", ".join(f"{c} ({df[c].dtype})" for c in df.columns)
@@ -420,18 +436,24 @@ def build_system_prompt(df, data_quality_findings):
         founder_name=FOUNDER_NAME, founder_title=FOUNDER_TITLE,
         data_desc=data_desc, data_quality=dq_text,
         past_learnings=summarize_past_learnings(),
+        session_so_far=summarize_session_so_far(),
     )
 
 # ============================================================
 # AGENT TURN
 # ============================================================
 
-def run_agent_turn(client, model, df, messages, max_tool_calls=10):
+def run_agent_turn(client, model, df, messages, max_tool_calls=10, context_start_idx=1):
     tool_calls_used = 0
     while True:
+        # Bound what's actually sent to the API: system message + only the messages from
+        # this turn onward. Older turns' raw tool payloads are dropped (the model still has
+        # access to what matters via the "THIS SESSION SO FAR" summary in the system prompt),
+        # which keeps token usage roughly flat instead of growing with the whole conversation.
+        api_messages = [messages[0]] + messages[max(context_start_idx, 1):]
         try:
             resp = client.chat.completions.create(
-                model=model, messages=messages, tools=TOOL_SCHEMA, tool_choice="auto", temperature=0.4,
+                model=model, messages=api_messages, tools=TOOL_SCHEMA, tool_choice="auto", temperature=0.4,
             )
         except Exception as e:
             err_name = type(e).__name__
@@ -640,7 +662,8 @@ with st.sidebar:
     st.header("Setup")
     api_key = st.text_input("Groq API Key", type="password")
     model = st.selectbox("Model", ["llama-3.3-70b-versatile", "deepseek-r1-distill-llama-70b", "llama-3.1-8b-instant"], index=0)
-    max_tool_calls = st.slider("Max tool calls per turn", 1, 20, 8)
+    max_tool_calls = st.slider("Max tool calls per turn", 1, 20, 4)
+    st.caption("Kept low by default — Groq's free tier caps at 12,000 tokens/minute, and each tool call is a full API round-trip.")
     st.divider()
     uploaded_file = st.file_uploader("Upload OHLCV CSV", type=["csv"])
     if uploaded_file is not None:
@@ -721,8 +744,13 @@ if user_input:
         with st.chat_message("user"):
             st.write(user_input)
 
+        turn_start_idx = len(st.session_state.messages) - 1
+
         client = Groq(api_key=api_key)
         with st.spinner("Researching..."):
-            success = run_agent_turn(client, model, st.session_state.df, st.session_state.messages, max_tool_calls)
+            success = run_agent_turn(
+                client, model, st.session_state.df, st.session_state.messages,
+                max_tool_calls, context_start_idx=turn_start_idx,
+            )
         if success:
             st.rerun()
