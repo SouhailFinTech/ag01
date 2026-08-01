@@ -29,6 +29,7 @@ import json
 import io
 import os
 import re
+import hashlib
 import datetime
 import multiprocessing as mp
 import traceback
@@ -306,14 +307,23 @@ TOOL_SCHEMA = [{
             "- 'baseline': ONLY the first literal, unmodified translation of the strategy. Can only "
             "happen ONCE — a second attempt is rejected by the system. No improvements or fixes, "
             "even obvious ones — implement exactly as described and report what actually happens.\n"
-            "- 'variant': every run after baseline exists. Requires a `hypothesis` string naming the "
-            "specific mechanism being tested."
+            "- 'variant': every new strategy attempt after baseline exists. Requires a `hypothesis` "
+            "string naming the specific mechanism being tested. The system checks that the code "
+            "actually differs in substance from the baseline and every prior variant (not just the "
+            "notes/label) — a variant that doesn't genuinely change the logic will be rejected.\n"
+            "- 'inspect': for diagnostic/exploratory code that is NOT a new strategy — e.g. showing "
+            "individual trade entry/exit prices, checking a specific calculation, printing the first "
+            "N rows of a computed column. Use this whenever you need to answer a specific factual "
+            "question about the data or a prior run's behavior. This never counts as a baseline or "
+            "variant and has no hypothesis requirement — but you must actually call it to get real "
+            "numbers. Never state specific trade prices, counts, or figures without having just run "
+            "inspect code to produce them in this exchange."
         ),
-        "parameters": {
+        "        "parameters": {
             "type": "object",
             "properties": {
                 "code": {"type": "string", "description": "Full Python code to execute."},
-                "run_type": {"type": "string", "enum": ["baseline", "variant"]},
+                "run_type": {"type": "string", "enum": ["baseline", "variant", "inspect"]},
                 "hypothesis": {"type": "string", "description": "Required for variants."},
             },
             "required": ["code", "run_type"],
@@ -365,7 +375,16 @@ Always:
   you very likely have a units/scaling bug — check whether you're returning a raw price difference
   instead of a percentage before reporting.
 - Every variant's hypothesis must describe a genuinely different mechanism from prior attempts, not
-  a reworded restatement — near-duplicate hypotheses will be rejected automatically.
+  a reworded restatement — near-duplicate hypotheses AND near-identical code will be rejected
+  automatically, even if the label/notes text is different.
+- If asked a specific factual question about trades, prices, or any number not already in this
+  conversation's execution history (e.g. "show me the first 3 trades"), you MUST call the tool with
+  run_type='inspect' to compute it from the real data. Never state specific numbers from memory or
+  inference — if you haven't just run code to get a number in this exchange, you don't have it yet.
+- Before reporting any aggregate stat, sanity-check it against anything else you've already shown in
+  this conversation. If a trade-level detail you produce contradicts an aggregate you reported
+  earlier (e.g. describing a winning trade while your win rate was 0%), stop and flag the
+  contradiction yourself rather than presenting both as true.
 
 Be direct and substantive — you're a working research partner, not a disclaimer generator."""
 
@@ -387,6 +406,23 @@ def build_system_prompt(df, data_quality_findings):
 # ============================================================
 # AGENT TURN
 # ============================================================
+
+def _normalize_code_for_dedup(code: str) -> str:
+    """Strips comments, whitespace, and the cosmetic `notes` line so a variant
+    that only relabels itself (without changing real logic) hashes identically
+    to what it copied."""
+    lines = []
+    for line in code.split("\n"):
+        line = re.sub(r"#.*$", "", line).strip()
+        if not line:
+            continue
+        if re.match(r"^['\"]?notes['\"]?\s*[:=]", line):
+            continue
+        lines.append(re.sub(r"\s+", " ", line))
+    return "\n".join(lines)
+
+def _code_hash(code: str) -> str:
+    return hashlib.sha256(_normalize_code_for_dedup(code).encode()).hexdigest()
 
 def _hypothesis_too_similar(new_hyp, existing_hyps, threshold=0.75):
     """Cheap similarity check to stop the agent looping on near-identical variants."""
@@ -466,6 +502,37 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
                 }
                 with st.chat_message("assistant"):
                     st.error("♻️ Duplicate hypothesis rejected — propose something genuinely different.")
+            elif run_type == "variant" and _code_hash(code) in (
+                [st.session_state.baseline["code_hash"]] + [v["code_hash"] for v in st.session_state.variants]
+            ):
+                exec_result = {
+                    "ok": False,
+                    "error": (
+                        "REJECTED: this code is logically identical to the baseline or a prior variant "
+                        "(only cosmetic/label differences detected, e.g. the `notes` string). A variant "
+                        "must contain an actual, substantive logic change to be valid — relabeling the "
+                        "same code as 'improved' is not a real test."
+                    ),
+                    "stdout": "", "_audit_warnings": [],
+                }
+                with st.chat_message("assistant"):
+                    st.error("🪞 Rejected: code is functionally identical to a prior run, despite a different hypothesis label.")
+            elif run_type == "inspect":
+                exec_result = run_code_safely(code, df) if df is not None else {
+                    "ok": False, "error": "No data uploaded yet.", "stdout": ""
+                }
+                exec_result["_audit_warnings"] = []
+                with st.chat_message("assistant"):
+                    with st.expander("🔍 Inspection — code executed", expanded=False):
+                        st.code(code, language="python")
+                    if exec_result["ok"]:
+                        st.success("Executed successfully")
+                        st.json(exec_result["results"])
+                        if exec_result.get("stdout"):
+                            st.text(exec_result["stdout"])
+                    else:
+                        st.error("Execution failed")
+                        st.code(exec_result["error"])
             else:
                 exec_result = run_code_safely(code, df) if df is not None else {
                     "ok": False, "error": "No data uploaded yet.", "stdout": ""
@@ -493,7 +560,7 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
                 if exec_result["ok"]:
                     entry = {
                         "run_type": run_type, "results": exec_result["results"],
-                        "audit_warnings": audit_warnings,
+                        "audit_warnings": audit_warnings, "code_hash": _code_hash(code),
                     }
                     if run_type == "baseline":
                         entry["code"] = code
