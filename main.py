@@ -7,13 +7,10 @@ Paste a plain-English strategy description or a research paper excerpt.
 The agent implements it LITERALLY first (no improvements, no fixes) and runs
 it once — that becomes the frozen baseline, shown raw, good or bad. Only
 after the baseline is locked can it propose hypothesis-driven variants, each
-one run and compared against that frozen baseline.
-
-Also includes:
-- An automatic data quality audit that runs on upload, before any strategy work.
-- A persistent research log (on disk) so lessons from past sessions carry
-  forward into future ones — the honest version of "continuous learning" for
-  a system built on a stateless LLM.
+one run and compared against that frozen baseline. Variants must contain a
+genuine logic change (checked by code hash, not just label text) or they're
+rejected. A third run type, 'inspect', lets it answer factual questions about
+the data/trades with real execution instead of guessing.
 
 Run with:
     pip install streamlit groq pandas numpy pyarrow
@@ -83,7 +80,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ============================================================
-# DATA QUALITY AUDIT (runs on upload, before any strategy work)
+# DATA QUALITY AUDIT
 # ============================================================
 
 def audit_data_quality(df: pd.DataFrame) -> list:
@@ -109,13 +106,13 @@ def audit_data_quality(df: pd.DataFrame) -> list:
             if parsed.notna().sum() > 1:
                 diffs = parsed.dropna().diff().dropna()
                 if not diffs.is_monotonic_increasing and (diffs < pd.Timedelta(0)).any():
-                    findings.append(f"Timestamps in '{date_col}' are not monotonically increasing — data may be out of order.")
+                    findings.append(f"Timestamps in '{date_col}' are not monotonically increasing.")
                 if len(diffs) > 0:
                     mode_gap = diffs.mode()
                     if len(mode_gap) > 0:
                         big_gaps = (diffs > mode_gap.iloc[0] * 5).sum()
                         if big_gaps > 0:
-                            findings.append(f"{big_gaps} unusually large time gap(s) detected relative to the typical bar interval — possible missing sessions/data holes.")
+                            findings.append(f"{big_gaps} unusually large time gap(s) detected — possible missing sessions/data holes.")
         except Exception:
             findings.append(f"Could not parse '{date_col}' as datetime — verify its format.")
     else:
@@ -130,7 +127,8 @@ def audit_data_quality(df: pd.DataFrame) -> list:
         except Exception:
             pass
 
-    if "high" in [c.lower() for c in df.columns] and "low" in [c.lower() for c in df.columns]:
+    lower_cols = [c.lower() for c in df.columns]
+    if "high" in lower_cols and "low" in lower_cols:
         h = pd.to_numeric(df[[c for c in df.columns if c.lower() == "high"][0]], errors="coerce")
         l = pd.to_numeric(df[[c for c in df.columns if c.lower() == "low"][0]], errors="coerce")
         bad = (h < l).sum()
@@ -143,7 +141,7 @@ def audit_data_quality(df: pd.DataFrame) -> list:
     return findings
 
 # ============================================================
-# PERSISTENT RESEARCH LOG (honest version of "continuous learning")
+# PERSISTENT RESEARCH LOG
 # ============================================================
 
 def load_learnings():
@@ -162,17 +160,14 @@ def save_learning(entry: dict):
         with open(LEARNINGS_FILE, "w") as f:
             json.dump(log[-200:], f, indent=2, default=str)
     except Exception:
-        pass  # non-fatal — e.g. read-only filesystem on some hosts
+        pass
 
 def summarize_past_learnings(max_entries=6) -> str:
     log = load_learnings()
     if not log:
         return "No prior research sessions logged yet."
     recent = log[-max_entries:]
-    lines = []
-    for e in recent:
-        lines.append(f"- [{e.get('type', '?')}] {e.get('summary', '')}")
-    return "\n".join(lines)
+    return "\n".join(f"- [{e.get('type', '?')}] {e.get('summary', '')}" for e in recent)
 
 # ============================================================
 # SANDBOXED EXECUTION
@@ -188,6 +183,13 @@ def _restricted_import(name, *args, **kwargs):
 def _worker(code, df_bytes, queue):
     try:
         df = pd.read_parquet(io.BytesIO(df_bytes)) if df_bytes else None
+
+        # Compatibility shim: LLMs often confuse np./pd. namespaces (e.g. np.to_datetime).
+        # Only fill gaps, never override real numpy functions.
+        for _name in ("to_datetime", "concat", "notnull", "isnull"):
+            if not hasattr(np, _name):
+                setattr(np, _name, getattr(pd, _name))
+
         safe_builtins = {
             "__import__": _restricted_import, "range": range, "len": len, "min": min, "max": max,
             "sum": sum, "abs": abs, "round": round, "sorted": sorted, "enumerate": enumerate,
@@ -195,12 +197,6 @@ def _worker(code, df_bytes, queue):
             "int": int, "str": str, "bool": bool, "print": print, "isinstance": isinstance,
             "Exception": Exception, "ValueError": ValueError, "True": True, "False": False, "None": None,
         }
-        # Compatibility shim: LLMs frequently confuse np./pd. namespaces (e.g. np.to_datetime).
-        # Only fill in gaps, never override real numpy functions.
-        for _name in ("to_datetime", "concat", "notnull", "isnull"):
-            if not hasattr(np, _name):
-                setattr(np, _name, getattr(pd, _name))
-
         namespace = {"__builtins__": safe_builtins, "pd": pd, "np": np, "df": df.copy() if df is not None else None}
         stdout_buf = io.StringIO()
         with redirect_stdout(stdout_buf):
@@ -231,8 +227,20 @@ def run_code_safely(code, df, timeout=30):
         return queue.get()
     return {"ok": False, "error": "Process ended with no output.", "stdout": ""}
 
+def _json_default(obj):
+    """Handles numpy types (int64, float64, bool_, ndarray) json.dumps can't serialize natively."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return str(obj)
+
 # ============================================================
-# INDEPENDENT AUDIT (strategy code, not data)
+# INDEPENDENT AUDIT (strategy code)
 # ============================================================
 
 def audit_code(code: str) -> list:
@@ -253,35 +261,20 @@ def audit_code(code: str) -> list:
         denom = dd_match.group(1).lower()
         if "cum_p" in denom or ("cum" in denom and "equity" not in denom and "balance" not in denom):
             warnings.append(
-                "DRAWDOWN FORMULA RISK: divided by raw cumulative P&L (can approach zero early on) "
-                "instead of an equity curve (starting capital + cumulative P&L)."
+                "DRAWDOWN FORMULA RISK: divided by raw cumulative P&L instead of an equity curve "
+                "(starting capital + cumulative P&L)."
             )
 
     if "daily" in lower and "rolling(" in lower and "groupby" not in lower:
         warnings.append(
             "DAILY METRIC RISK: 'daily' appears to use a fixed rolling window rather than grouping "
-            "by actual calendar date — verify the window truly equals one trading day."
+            "by actual calendar date."
         )
 
     if "equity" not in lower and "balance" not in lower and "capital" not in lower:
-        warnings.append(
-            "NO EXPLICIT EQUITY CURVE: no account equity/balance/capital tracked from a defined "
-            "starting size."
-        )
+        warnings.append("NO EXPLICIT EQUITY CURVE: no account equity/balance/capital tracked from a defined starting size.")
 
     return warnings
-
-def _json_default(obj):
-    """Handles numpy types (int64, float64, bool_, ndarray) that json.dumps can't serialize natively."""
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return float(obj)
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    return str(obj)
 
 def format_audit_note(warnings):
     if not warnings:
@@ -289,6 +282,39 @@ def format_audit_note(warnings):
     lines = ["[AUTOMATED AUDIT] Issues detected:"] + [f"- {w}" for w in warnings]
     lines.append("Address these or explain why they don't apply.")
     return "\n".join(lines)
+
+# ============================================================
+# DEDUP: hypothesis text + code logic
+# ============================================================
+
+def _normalize_code_for_dedup(code: str) -> str:
+    """Strips comments, whitespace, and the cosmetic `notes` line so a variant
+    that only relabels itself hashes identically to what it copied."""
+    lines = []
+    for line in code.split("\n"):
+        line = re.sub(r"#.*$", "", line).strip()
+        if not line:
+            continue
+        if re.match(r"^['\"]?notes['\"]?\s*[:=]", line):
+            continue
+        lines.append(re.sub(r"\s+", " ", line))
+    return "\n".join(lines)
+
+def _code_hash(code: str) -> str:
+    return hashlib.sha256(_normalize_code_for_dedup(code).encode()).hexdigest()
+
+def _hypothesis_too_similar(new_hyp, existing_hyps, threshold=0.75):
+    new_words = set(re.findall(r"\w+", new_hyp.lower()))
+    if not new_words:
+        return False
+    for h in existing_hyps:
+        h_words = set(re.findall(r"\w+", h.lower()))
+        if not h_words:
+            continue
+        overlap = len(new_words & h_words) / len(new_words | h_words)
+        if overlap >= threshold:
+            return True
+    return False
 
 # ============================================================
 # TOOL SCHEMA
@@ -306,20 +332,19 @@ TOOL_SCHEMA = [{
             "run_type must be:\n"
             "- 'baseline': ONLY the first literal, unmodified translation of the strategy. Can only "
             "happen ONCE — a second attempt is rejected by the system. No improvements or fixes, "
-            "even obvious ones — implement exactly as described and report what actually happens.\n"
+            "even obvious ones.\n"
             "- 'variant': every new strategy attempt after baseline exists. Requires a `hypothesis` "
-            "string naming the specific mechanism being tested. The system checks that the code "
-            "actually differs in substance from the baseline and every prior variant (not just the "
-            "notes/label) — a variant that doesn't genuinely change the logic will be rejected.\n"
+            "string naming the specific mechanism being tested. The system checks the code actually "
+            "differs in substance from the baseline and every prior variant, not just the notes/label "
+            "— a variant that doesn't genuinely change the logic will be rejected.\n"
             "- 'inspect': for diagnostic/exploratory code that is NOT a new strategy — e.g. showing "
-            "individual trade entry/exit prices, checking a specific calculation, printing the first "
-            "N rows of a computed column. Use this whenever you need to answer a specific factual "
-            "question about the data or a prior run's behavior. This never counts as a baseline or "
-            "variant and has no hypothesis requirement — but you must actually call it to get real "
-            "numbers. Never state specific trade prices, counts, or figures without having just run "
-            "inspect code to produce them in this exchange."
+            "individual trade entry/exit prices, checking a calculation, printing rows of a computed "
+            "column. Use this whenever asked a specific factual question about the data or a prior "
+            "run's behavior. Never counts as a baseline or variant, no hypothesis required — but it "
+            "must be a real execution. Never state specific trade prices, counts, or figures without "
+            "having just run inspect code to produce them."
         ),
-        "        "parameters": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "code": {"type": "string", "description": "Full Python code to execute."},
@@ -340,8 +365,7 @@ collaborator, not a chatbot that hedges everything with disclaimers instead of d
 DATA QUALITY AUDIT (run automatically on upload — read this before writing any strategy code):
 {data_quality}
 
-RESEARCH LOG FROM PAST SESSIONS (carry these lessons forward — don't repeat known mistakes or
-re-litigate settled findings without reason):
+RESEARCH LOG FROM PAST SESSIONS (carry these lessons forward — don't repeat known mistakes):
 {past_learnings}
 
 Your process is strict and two-phase:
@@ -352,39 +376,34 @@ fixes, no tweaks, even ones you spot immediately. Run it with run_type='baseline
 result honestly, even if it's bad. This baseline is frozen the moment it succeeds — the system will
 not let you run a second baseline. If genuinely ambiguous, ask before running.
 
-If the data quality audit above flagged real issues (gaps, duplicates, non-monotonic timestamps,
-impossible bars), address them explicitly in your baseline code — e.g. drop duplicates, handle
-gaps sensibly — and say plainly what you did and why, so the fix is visible, not silent.
+If the data quality audit flagged real issues (gaps, duplicates, non-monotonic timestamps,
+impossible bars), address them explicitly in your baseline code and say plainly what you did, so
+the fix is visible, not silent.
 
 PHASE 2 — HYPOTHESIS-DRIVEN ITERATION (after baseline exists):
 Every change is a run_type='variant' with a specific `hypothesis` naming the mechanism, grounded in
-actual market/strategy reasoning — not blind parameter grinding. Every variant is compared against
-the frozen baseline automatically. Never claim a variant is better without having run it this turn.
+real market/strategy reasoning. Every variant is compared against the frozen baseline automatically.
+Never claim a variant is better without having run it this turn.
 
 Always:
 - NO LOOKAHEAD BIAS: any signal from bar t must be shifted forward before capturing a return.
 - Track a real equity curve from an explicit starting capital.
 - Ask when something's genuinely unclear rather than guessing on something that would change the science.
 - Address every automated audit warning or explain concretely why it doesn't apply.
-- Use pandas (`pd`) for datetime parsing and dataframe operations — `pd.to_datetime`, not
-  `np.to_datetime`. numpy does not have datetime parsing.
+- Use pandas (`pd`) for datetime parsing — `pd.to_datetime`, not `np.to_datetime`.
 - SANITY-CHECK YOUR OWN RESULTS before reporting them. If total_trades is close to the number of
-  rows in the data, your entry condition is almost certainly not filtering anything — that is a bug,
-  not a real strategy, and you must say so rather than report it as a result. If profit_pct is many
-  orders of magnitude smaller than a normal percentage (e.g. 1e-05 instead of a number like 3.2),
-  you very likely have a units/scaling bug — check whether you're returning a raw price difference
-  instead of a percentage before reporting.
-- Every variant's hypothesis must describe a genuinely different mechanism from prior attempts, not
-  a reworded restatement — near-duplicate hypotheses AND near-identical code will be rejected
-  automatically, even if the label/notes text is different.
-- If asked a specific factual question about trades, prices, or any number not already in this
-  conversation's execution history (e.g. "show me the first 3 trades"), you MUST call the tool with
-  run_type='inspect' to compute it from the real data. Never state specific numbers from memory or
-  inference — if you haven't just run code to get a number in this exchange, you don't have it yet.
-- Before reporting any aggregate stat, sanity-check it against anything else you've already shown in
-  this conversation. If a trade-level detail you produce contradicts an aggregate you reported
-  earlier (e.g. describing a winning trade while your win rate was 0%), stop and flag the
-  contradiction yourself rather than presenting both as true.
+  rows in the data, your entry condition is almost certainly not filtering anything — say so rather
+  than report it as a result. If profit_pct is many orders of magnitude smaller than a normal
+  percentage, you likely have a units/scaling bug — check before reporting.
+- Every variant's hypothesis must describe a genuinely different mechanism from prior attempts —
+  near-duplicate hypotheses AND near-identical code will be rejected automatically, even if the
+  label/notes text differs.
+- If asked a specific factual question about trades, prices, or any number not already established
+  in this conversation, you MUST call the tool with run_type='inspect' to compute it from the real
+  data. Never state specific numbers from memory or inference.
+- Before reporting any statistic, sanity-check it against anything you've already shown in this
+  conversation. If a trade-level detail contradicts an aggregate you reported earlier, stop and flag
+  the contradiction yourself rather than presenting both as true.
 
 Be direct and substantive — you're a working research partner, not a disclaimer generator."""
 
@@ -407,38 +426,6 @@ def build_system_prompt(df, data_quality_findings):
 # AGENT TURN
 # ============================================================
 
-def _normalize_code_for_dedup(code: str) -> str:
-    """Strips comments, whitespace, and the cosmetic `notes` line so a variant
-    that only relabels itself (without changing real logic) hashes identically
-    to what it copied."""
-    lines = []
-    for line in code.split("\n"):
-        line = re.sub(r"#.*$", "", line).strip()
-        if not line:
-            continue
-        if re.match(r"^['\"]?notes['\"]?\s*[:=]", line):
-            continue
-        lines.append(re.sub(r"\s+", " ", line))
-    return "\n".join(lines)
-
-def _code_hash(code: str) -> str:
-    return hashlib.sha256(_normalize_code_for_dedup(code).encode()).hexdigest()
-
-def _hypothesis_too_similar(new_hyp, existing_hyps, threshold=0.75):
-    """Cheap similarity check to stop the agent looping on near-identical variants."""
-    new_words = set(re.findall(r"\w+", new_hyp.lower()))
-    if not new_words:
-        return False
-    for h in existing_hyps:
-        h_words = set(re.findall(r"\w+", h.lower()))
-        if not h_words:
-            continue
-        overlap = len(new_words & h_words) / len(new_words | h_words)
-        if overlap >= threshold:
-            return True
-    return False
-
-
 def run_agent_turn(client, model, df, messages, max_tool_calls=10):
     tool_calls_used = 0
     while True:
@@ -456,6 +443,7 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
             with st.chat_message("assistant"):
                 st.error(err_text)
             return False
+
         msg = resp.choices[0].message
         content = msg.content or ""
         messages.append(msg.model_dump(exclude_none=True))
@@ -464,7 +452,15 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
                 st.write(content)
 
         if not msg.tool_calls:
-            return
+            if not content:
+                fallback = (
+                    "⚠️ The model returned an empty response with no follow-up action. Try "
+                    "rephrasing — e.g. describe the strategy directly instead of a short greeting."
+                )
+                st.session_state.last_error = fallback
+                with st.chat_message("assistant"):
+                    st.warning(fallback)
+            return True
 
         for tool_call in msg.tool_calls:
             tool_calls_used += 1
@@ -481,6 +477,7 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
                 }
                 with st.chat_message("assistant"):
                     st.error("🔒 Baseline already frozen — rejecting second baseline attempt.")
+
             elif run_type == "variant" and st.session_state.baseline is None:
                 exec_result = {
                     "ok": False,
@@ -489,6 +486,7 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
                 }
                 with st.chat_message("assistant"):
                     st.error("⛔ No baseline yet — variant rejected.")
+
             elif run_type == "variant" and _hypothesis_too_similar(
                 hypothesis, [v["hypothesis"] for v in st.session_state.variants]
             ):
@@ -502,6 +500,7 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
                 }
                 with st.chat_message("assistant"):
                     st.error("♻️ Duplicate hypothesis rejected — propose something genuinely different.")
+
             elif run_type == "variant" and _code_hash(code) in (
                 [st.session_state.baseline["code_hash"]] + [v["code_hash"] for v in st.session_state.variants]
             ):
@@ -510,13 +509,13 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
                     "error": (
                         "REJECTED: this code is logically identical to the baseline or a prior variant "
                         "(only cosmetic/label differences detected, e.g. the `notes` string). A variant "
-                        "must contain an actual, substantive logic change to be valid — relabeling the "
-                        "same code as 'improved' is not a real test."
+                        "must contain an actual, substantive logic change."
                     ),
                     "stdout": "", "_audit_warnings": [],
                 }
                 with st.chat_message("assistant"):
                     st.error("🪞 Rejected: code is functionally identical to a prior run, despite a different hypothesis label.")
+
             elif run_type == "inspect":
                 exec_result = run_code_safely(code, df) if df is not None else {
                     "ok": False, "error": "No data uploaded yet.", "stdout": ""
@@ -533,6 +532,7 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
                     else:
                         st.error("Execution failed")
                         st.code(exec_result["error"])
+
             else:
                 exec_result = run_code_safely(code, df) if df is not None else {
                     "ok": False, "error": "No data uploaded yet.", "stdout": ""
@@ -584,7 +584,7 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
             if tool_calls_used >= max_tool_calls:
                 with st.chat_message("assistant"):
                     st.info("Hit the per-turn execution limit — say 'continue' if you want more.")
-                return
+                return True
 
 # ============================================================
 # SCOREBOARD
@@ -640,7 +640,7 @@ with st.sidebar:
     st.header("Setup")
     api_key = st.text_input("Groq API Key", type="password")
     model = st.selectbox("Model", ["llama-3.3-70b-versatile", "deepseek-r1-distill-llama-70b", "llama-3.1-8b-instant"], index=0)
-    max_tool_calls = st.slider("Max tool calls per turn", 1, 20, 10)
+    max_tool_calls = st.slider("Max tool calls per turn", 1, 20, 8)
     st.divider()
     uploaded_file = st.file_uploader("Upload OHLCV CSV", type=["csv"])
     if uploaded_file is not None:
@@ -677,6 +677,7 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.baseline = None
         st.session_state.variants = []
+        st.session_state.last_error = None
         st.rerun()
 
 render_scoreboard()
@@ -722,5 +723,6 @@ if user_input:
 
         client = Groq(api_key=api_key)
         with st.spinner("Researching..."):
-            run_agent_turn(client, model, st.session_state.df, st.session_state.messages, max_tool_calls)
-        st.rerun()
+            success = run_agent_turn(client, model, st.session_state.df, st.session_state.messages, max_tool_calls)
+        if success:
+            st.rerun()
