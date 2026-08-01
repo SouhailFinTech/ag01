@@ -412,16 +412,14 @@ def run_agent_turn(client, model, df, messages, max_tool_calls=10):
             )
         except Exception as e:
             err_name = type(e).__name__
+            if "RateLimit" in err_name:
+                err_text = "⏳ Hit the Groq API rate limit. Wait a minute, or reduce 'Max tool calls per turn' in the sidebar."
+            else:
+                err_text = f"API error ({err_name}): {e}"
+            st.session_state.last_error = err_text
             with st.chat_message("assistant"):
-                if "RateLimit" in err_name:
-                    st.error(
-                        "⏳ Hit the Groq API rate limit. This usually means too many similar attempts "
-                        "were fired in a row. Wait a minute and try again, or reduce 'Max tool calls "
-                        "per turn' in the sidebar."
-                    )
-                else:
-                    st.error(f"API error ({err_name}): {e}")
-            return
+                st.error(err_text)
+            return False
         msg = resp.choices[0].message
         content = msg.content or ""
         messages.append(msg.model_dump(exclude_none=True))
